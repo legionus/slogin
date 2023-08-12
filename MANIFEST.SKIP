@@ -1,0 +1,7 @@
+\.git
+\.exists
+LIBC_XS.bs
+LIBC_XS.c
+LIBC_XS.o
+Makefile.old
+blib

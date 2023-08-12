@@ -1,0 +1,11 @@
+bin/slogin
+LIBC_XS.pm
+LIBC_XS.xs
+LICENSE
+Makefile
+Makefile.PL
+MANIFEST			This list of files
+MANIFEST.SKIP
+README.md
+slogin-dev
+typemap

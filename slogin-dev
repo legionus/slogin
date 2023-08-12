@@ -1,0 +1,9 @@
+#!/bin/sh -efu
+
+cwd="$(readlink -ev "$0")"
+cwd="${cwd%/*}"
+
+exec perl \
+	-I"$cwd/blib/lib" \
+	-I"$cwd/blib/arch" \
+	-- "$cwd/bin/slogin" "$@"

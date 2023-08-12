@@ -1,0 +1,8 @@
+*.bs
+*.c
+*.o
+.exists
+Makefile
+Makefile.old
+blib/**
+pm_to_blib

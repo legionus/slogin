@@ -1,0 +1,875 @@
+#!/usr/bin/env perl
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2023  Alexey Gladkov <gladkov.alexey@gmail.com>
+
+use strict;
+use warnings FATAL => qw(all);
+no warnings 'exec';
+
+require "sys/ioctl.ph";
+
+use Getopt::Long;
+use POSIX;
+use Curses;
+use Authen::PAM;
+use Sys::Syslog qw(:standard :macros);
+use LIBC_XS;
+
+END {
+	endwin();
+}
+
+use constant {
+	PROGNAME => "slogin",
+	VERSION  => "1.0",
+
+	_PATH_BSHELL       => "/bin/sh",
+	_PATH_DEFPATH      => "/usr/local/bin:/bin:/usr/bin",
+	_PATH_DEFPATH_ROOT => "/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin",
+	_PATH_MAILDIR      => "/var/spool/mail",
+	_PATH_ISSUE        => "/etc/issue",
+	_PATH_LOGINDEFS    => "/etc/login.defs",
+
+	_PATH_LOGIN_FILENAME => ".login",
+
+	PW_NAME    => 0,
+	PW_PASSWD  => 1,
+	PW_UID     => 2,
+	PW_GID     => 3,
+	PW_QUOTA   => 4,
+	PW_COMMENT => 5,
+	PW_GCOS    => 6,
+	PW_HOME    => 7,
+	PW_SHELL   => 8,
+	PW_EXPIRE  => 9,
+
+	EXIT_SUCCESS => 0,
+	EXIT_FAILURE => 1,
+};
+
+our $inloop = 1;
+our $abort = 0;
+our $errmsg = "";
+
+sub errmsg
+{
+	$errmsg = sprintf($_[0], @_[1..$#_]);
+	syslog(LOG_ERR, @_);
+	return 0;
+}
+
+my $map_key_string = {
+	hex('09') => 'KEY_TAB',
+	hex('0A') => 'KEY_ENTER',
+	hex('1B') => 'KEY_ESCAPE',
+};
+
+sub key_to_sym
+{
+	my $key = shift;
+
+	# Control characters. Change them into something printable
+	# via Curses' unctrl function.
+	if ($key lt ' ') {
+		my $s = $map_key_string->{ord($key)} || uc(unctrl($key));
+		return '<' . $s . '>';
+	}
+	# Extended keys get translated into their names via Curses'
+	# keyname function.
+	if ($key =~ /^\d{2,}$/) {
+		return '<' . uc(keyname($key)) . '>';
+	}
+	return $key;
+}
+
+my $colors;
+
+sub init_curs_colors
+{
+	use_default_colors();
+
+	eval { start_color };
+	die if $@;
+
+	$colors = {
+		cmap => {
+			default => -1,
+			black   => COLOR_BLACK,
+			red     => COLOR_RED,
+			green   => COLOR_GREEN,
+			yellow  => COLOR_YELLOW,
+			blue    => COLOR_BLUE,
+			magenta => COLOR_MAGENTA,
+			cyan    => COLOR_CYAN,
+			white   => COLOR_WHITE,
+		},
+		next_color => 8,
+		pmap       => {},
+		next_pair  => 1,
+	};
+}
+
+sub color_pair
+{
+	my ($fg, $bg) = @_;
+
+	die("Too many color pairs defined") unless $colors->{next_pair} <= POSIX::SHRT_MAX;
+	die("Background color '$bg' not found") unless defined $colors->{cmap}->{$bg};
+	die("Foreground color '$fg' not found") unless defined $colors->{cmap}->{$fg};
+
+	my $pair = "$bg:$fg";
+
+	unless (defined $colors->{pmap}->{$pair}) {
+		eval { init_pair($colors->{next_pair}, $colors->{cmap}->{$fg}, $colors->{cmap}->{$bg}) };
+		die("$@") if $@;
+
+		$colors->{pmap}->{$pair} = $colors->{next_pair};
+		$colors->{next_pair}++;
+	}
+
+	return COLOR_PAIR($colors->{pmap}->{$pair});
+}
+
+sub input_text
+{
+	my ($win, $text) = @_;
+
+	$win->{text} = $text;
+	$win->{durty} = 1;
+
+	$text = substr($win->{text}, -$win->{input_len});
+	$text = "*" x length($text) if $win->{noecho};
+
+	$win->{curs}->move($win->{input_y}, $win->{input_x});
+	$win->{curs}->clrtoeol();
+
+	$win->{curs}->addstring($win->{label});
+	$win->{curs}->addstring($text);
+}
+
+sub new_window
+{
+	my ($screen, $name) = @_;
+
+	if (!defined($screen->{childs}->{$name})) {
+		$screen->{childs}->{$name} = {
+			label     => "",
+			text      => "",
+			color     => undef,
+			height    => 0,
+			width     => 0,
+			y         => 0,
+			x         => 0,
+			input_x   => 0,
+			input_y   => 0,
+			input_len => 0,
+			focus     => 0,
+			focusable => 0,
+			durty     => 1,
+			noecho    => 0,
+			curs      => undef,
+		};
+		push(@{$screen->{order}}, $name);
+	}
+	return $screen->{childs}->{$name};
+}
+
+sub set_curs_focus
+{
+	my $screen = shift;
+	my $pick_focusable = 0;
+	my $focus;
+
+	my $i = 0;
+	while (1) {
+		$i = 0 if $i == @{$screen->{order}};
+		my $name = $screen->{order}->[$i];
+
+		if ($screen->{childs}->{$name}->{focusable}) {
+			if ($pick_focusable) {
+				$focus = $name;
+				last;
+			} elsif (@_ && $name eq $_[0]) {
+				$focus = $name;
+				last;
+			} elsif ($screen->{childs}->{$name}->{focus}) {
+				$pick_focusable = 1;
+			}
+		}
+
+		$screen->{childs}->{$name}->{focus} = 0;
+		$i++;
+	}
+
+	$screen->{childs}->{$focus}->{focus} = 1;
+	$screen->{childs}->{$focus}->{durty} = 1;
+}
+
+
+sub init_login_window
+{
+	my $screen = shift;
+	my ($border_top, $border_bottom, $border_left, $border_right) = (1, 0, 2, 2);
+
+	my $new = new_window($screen, "login");
+
+	$new->{label} = "Login   : ";
+	$new->{color} = color_pair('white', 'red');
+	$new->{focusable} = 1;
+	$new->{height} = 1 + $border_top + $border_bottom;
+	$new->{width} = 40 + $border_left + $border_right;
+	$new->{input_y} = $border_top;
+	$new->{input_x} = $border_left;
+	$new->{input_len} = $new->{width} - length($new->{label}) - ($border_left + $border_right);
+	$new->{y} = ceil(($screen->{height} - $new->{height}) / 2);
+	$new->{x} = ceil(($screen->{width} - $new->{width}) / 2);
+
+	$new->{curs} = newwin($new->{height}, $new->{width}, $new->{y}, $new->{x});
+	$new->{curs}->bkgd($new->{color});
+	$new->{curs}->addstring($new->{input_y}, $new->{input_x}, $new->{label});
+}
+
+sub init_password_window
+{
+	my $screen = shift;
+	my ($border_top, $border_bottom, $border_left, $border_right) = (0, 1, 2, 2);
+
+	my $new = new_window($screen, "password");
+
+	$new->{label} = "Password: ";
+	$new->{color} = color_pair('white', 'red');
+	$new->{focusable} = 1;
+	$new->{height} = 1 + $border_top + $border_bottom;
+	$new->{width} = 40 + $border_left + $border_right;
+	$new->{input_y} = $border_top;
+	$new->{input_x} = $border_left;
+	$new->{input_len} = $new->{width} - length($new->{label}) - ($border_left + $border_right);
+	$new->{noecho} = 1;
+	$new->{y} = $screen->{childs}->{login}->{y} + $screen->{childs}->{login}->{height};
+	$new->{x} = $screen->{childs}->{login}->{x};
+
+	$new->{curs} = newwin($new->{height}, $new->{width}, $new->{y}, $new->{x});
+	$new->{curs}->bkgd($new->{color});
+	$new->{curs}->addstring($new->{input_y}, $new->{input_x}, $new->{label});
+}
+
+sub init_message
+{
+	my ($screen, $message) = @_;
+	my ($border_top, $border_bottom, $border_left, $border_right) = (1, 1, 2, 2);
+
+	my $new = new_window($screen, "message");
+
+	$new->{color} = color_pair('white', 'red');
+	$new->{width} = 40 + $border_left + $border_right;
+	$new->{input_y} = $border_top;
+	$new->{input_x} = $border_left;
+	$new->{input_len} = $new->{width} - length($new->{label}) - ($border_left + $border_right);
+
+	if (length($message) > $new->{input_len}) {
+		$new->{height} = ceil(length($message) / $new->{input_len});
+	} else {
+		$new->{height} = 1;
+	}
+	$new->{height} += $border_top + $border_bottom;
+
+	$new->{y} = ceil(($screen->{height} - $new->{height}) / 2);
+	$new->{x} = ceil(($screen->{width} - $new->{width}) / 2);
+
+	$new->{curs} = newwin($new->{height}, $new->{width}, $new->{y}, $new->{x});
+	$new->{curs}->bkgd($new->{color});
+
+	for (my $y = $new->{input_y}; 1; $y++) {
+		my $line = substr($message, 0, $new->{input_len});
+
+		$new->{curs}->addstring($y, $new->{input_x}, $line);
+
+		last if length($message) < $new->{input_len};
+		$message = substr($message, $new->{input_len});
+	}
+}
+
+sub init_curs_screen
+{
+	my $context = shift;
+	my $scr = initscr();
+
+	keypad(1);
+	raw();
+	noecho();
+
+	init_curs_colors();
+
+	$scr->bkgd(color_pair('white', 'default'));
+
+	for (my $y = 0; $y < @{$context->{issue}}; $y++) {
+		$scr->addstring($y, 0, $context->{issue}->[$y]);
+	}
+
+	return  {
+		width     => $COLS,
+		height    => $LINES,
+		childs    => {},
+		order     => [],
+		focus     => 1,
+		focusable => 0,
+		curs      => $scr,
+	};
+}
+
+sub clear_curs_screen
+{
+	my ($context, $screen) = @_;
+
+	foreach my $name (@{$screen->{order}}) {
+		$screen->{childs}->{$name}->{curs}->delwin();
+	}
+	$screen->{order} = [];
+	$screen->{childs} = {};
+	$screen->{curs}->clear();
+
+	for (my $y = 0; $y < @{$context->{issue}}; $y++) {
+		$screen->{curs}->addstring($y, 0, $context->{issue}->[$y]);
+	}
+
+	curs_set(0);
+}
+
+sub draw_curs_screen
+{
+	my $screen = shift;
+	my $focus;
+
+	$screen->{curs}->noutrefresh();
+
+	foreach my $name (@{$screen->{order}}) {
+		next unless $screen->{childs}->{$name}->{durty};
+
+		$screen->{childs}->{$name}->{curs}->noutrefresh();
+		$screen->{childs}->{$name}->{durty} = 0;
+
+		$focus = $name if $screen->{childs}->{$name}->{focus};
+	}
+	$screen->{childs}->{$focus}->{curs}->noutrefresh() if $focus;
+	doupdate();
+}
+
+sub process_input
+{
+	my ($screen, $sym) = @_;
+	my $win;
+
+	foreach my $name (@{$screen->{order}}) {
+		if ($screen->{childs}->{$name}->{focus}) {
+			$win = $screen->{childs}->{$name};
+			last;
+		}
+	}
+	die("Window in focus not found") unless $win;
+
+	#print "input = {$sym}\n";
+
+	if ($sym eq "<KEY_ESCAPE>") {
+		$inloop = 0;
+		$abort = 1;
+		return 1;
+	}
+	if ($sym eq "<KEY_TAB>") {
+		set_curs_focus($screen);
+		return 1;
+	}
+	if ($sym eq "<KEY_ENTER>") {
+		foreach my $name (@{$screen->{order}}) {
+			next unless $screen->{childs}->{$name}->{focusable};
+			if (! length($screen->{childs}->{$name}->{text})) {
+				set_curs_focus($screen, $name);
+				return 1;
+			}
+		}
+		$inloop = 0;
+		return 1;
+	}
+	if ($sym eq "<^U>") {
+		input_text($win, "");
+		return 1;
+	}
+	if ($sym eq "<KEY_BACKSPACE>") {
+		my $len = length($win->{text});
+		input_text($win, substr($win->{text}, 0, $len - 1)) if $len > 0;
+		$win->{durty} = 1;
+		return 1;
+	}
+
+	input_text($win, $win->{text} . $sym);
+	return 1;
+}
+
+sub run_curs_loop
+{
+	my $screen = shift;
+
+	my $rin = '';
+	vec($rin, fileno(STDIN), 1) = 1;
+
+	while ($inloop) {
+		my $sym;
+
+		while (!$sym) {
+			my $rout = $rin;
+
+			$! = 0;
+			my $nfound = select($rout, undef, undef, undef);
+
+			die("select: $!") if $nfound < 0;
+			next if $nfound == 0;
+
+			my ($chr, $key) = $screen->{curs}->getchar();
+
+			if (defined($key)) {
+				$sym = key_to_sym($key);
+			} elsif (defined($chr)) {
+				$sym = key_to_sym($chr);
+			} else {
+				warn("getchar failed: $!");
+			}
+		}
+
+		process_input($screen, $sym);
+		draw_curs_screen($screen);
+	}
+}
+
+sub curs_errmsg
+{
+	my ($context, $screen) = @_;
+
+	syslog(LOG_ERR, $errmsg);
+
+	init_message($screen, $errmsg);
+	draw_curs_screen($screen);
+
+	pam_end($context->{pamh}, PAM_SYSTEM_ERR()) if $context->{pamh};
+
+	sleep($context->{config}->{FAIL_DELAY});
+	return EXIT_FAILURE;
+}
+
+sub open_tty
+{
+	my $tty_path = shift;
+
+	for (my $fd = _SC_OPEN_MAX; $fd > fileno(STDERR); $fd--) {
+		POSIX::close($fd);
+	}
+	close(STDIN);
+
+	sysopen(STDIN, $tty_path, O_RDWR|O_NONBLOCK) ||
+		die("Unable to open tty for stdin: ", $tty_path, ": ", $!);
+	die($tty_path, " is not a terminal") if ! -t STDIN;
+
+	my $flags = fcntl(STDIN, F_GETFL, 0) ||
+		die("Can't get flags for STDIN: ", $!);
+
+	$flags &= ~O_NONBLOCK;
+
+	fcntl(STDIN, F_SETFL, $flags) or
+		die("Can't set flags for STDIN: ", $!);
+
+	dup2(fileno(STDIN), fileno(STDOUT));
+	dup2(fileno(STDIN), fileno(STDERR));
+
+	binmode(STDIN, ":utf8");
+	binmode(STDOUT, ":utf8");
+	binmode(STDERR, ":utf8");
+}
+
+sub init_tty
+{
+	my $context = shift;
+
+	setsid();
+	open_tty($context->{tty});
+
+	my $fd = fileno(STDIN);
+
+	# Change permissions to restrict device.
+	fchown($fd, 0, 0) || return errmsg("chown(%d, 0, 0): %s", $fd, $!);
+	fchmod($fd, 0600) || return errmsg("chmod(%d, 0600): %s", $fd, $!);
+
+	# Kill processes left on this tty.
+	$SIG{HUP} = "IGNORE";
+	vhangup();
+	$SIG{HUP} = "DEFAULT";
+
+	# Re-open terminal just in case.
+	open_tty($context->{tty});
+
+	return 1;
+}
+
+sub chown_tty
+{
+	my $context = shift;
+
+	my $uid = $context->{passwd}->[PW_UID];
+	my $gid = $context->{passwd}->[PW_GID];
+	my $mod = $context->{config}->{TTYPERM};
+
+	if ($context->{config}->{TTYGROUP}) {
+		$gid = $context->{config}->{TTYGROUP};
+
+		if ($gid !~ /^\d+$/) {
+			return 0 unless $gid = getgrnam($gid);
+		}
+	}
+
+	my $fd = fileno(STDIN);
+
+	fchown($fd, $uid, $gid) ||
+		return errmsg("Unable to change owner to uid=%d, gid=%d: %s: %s", $uid, $gid, $context->{tty}, $!);
+
+	fchmod($fd, $mod) ||
+		return errmsg("Unable to change file mode to %o: %s: %s", $context->{config}->{TTYPERM}, $context->{tty}, $!);
+
+	return 1;
+}
+
+sub init_pam
+{
+	my $context = shift;
+	my $pamh;
+
+	my $res = pam_start("login", $pamh);
+
+	return errmsg("Unable to init PAM")
+		if ! defined($pamh) or $res != PAM_SUCCESS();
+
+	$res = pam_set_item($pamh, PAM_TTY(), $context->{tty});
+
+	return errmsg("Unable to set PAM_TTY item: %s", pam_strerror($pamh, $res))
+		if $res != PAM_SUCCESS();
+
+	$context->{pamh} = $pamh;
+	return 1;
+}
+
+sub errmsg_pam
+{
+	my ($context, $fmt, $res) = @_;
+	return errmsg($fmt, pam_strerror($context->{pamh}, $res));
+}
+
+sub auth
+{
+	my ($context, $username, $password) = @_;
+
+	my $conversation = sub {
+		my @res;
+
+		while (@_) {
+			my $code = shift;
+			my $msg = shift;
+			my $ans = "";
+
+			$ans = $username if $code == PAM_PROMPT_ECHO_ON();
+			$ans = $password if $code == PAM_PROMPT_ECHO_OFF();
+
+			push(@res, (PAM_SUCCESS(), $ans));
+		}
+		push(@res, PAM_SUCCESS());
+
+		return @res;
+	};
+
+	my $res = pam_set_item($context->{pamh}, PAM_CONV(), $conversation);
+
+	return errmsg_pam($context, "Unable to set PAM_CONV item: %s", $res)
+		if $res != PAM_SUCCESS();
+
+	$res = pam_authenticate($context->{pamh});
+
+	return errmsg_pam($context, "%s", $res)
+		if $res != PAM_SUCCESS();
+
+	my @pwd;
+
+	return errmsg("Invalid user name '%s'", $username)
+		unless @pwd = getpwnam($username);
+
+	$pwd[PW_SHELL] = _PATH_BSHELL if ! length $pwd[PW_SHELL];
+	$context->{passwd} = \@pwd;
+
+	return 1;
+}
+
+sub open_pam_session
+{
+	my $context = shift;
+
+	my $res = pam_setcred($context->{pamh}, PAM_ESTABLISH_CRED());
+
+	return errmsg_pam($context, "%s", $res)
+		if $res != PAM_SUCCESS();
+
+	$res = pam_open_session($context->{pamh}, 0);
+
+	if ($res != PAM_SUCCESS()) {
+		pam_setcred($context->{pamh}, PAM_DELETE_CRED());
+		return errmsg_pam($context, "%s", $res);
+	}
+
+	$res = pam_setcred($context->{pamh}, PAM_REINITIALIZE_CRED());
+
+	if ($res != PAM_SUCCESS()) {
+		pam_close_session($context->{pamh}, 0);
+		return errmsg_pam($context, "%s", $res);
+	}
+
+	return 1;
+}
+
+sub subst_issue
+{
+	my ($context, $arg) = @_;
+
+	return $context->{uname}->[0] if $arg eq '\s';
+	return $context->{uname}->[1] if $arg eq '\n';
+	return $context->{uname}->[2] if $arg eq '\r';
+	return $context->{uname}->[3] if $arg eq '\v';
+	return $context->{uname}->[4] if $arg eq '\m';
+	return substr($context->{tty}, 5) if $arg eq '\l';
+	return substr($arg, 1);
+}
+
+sub read_issue_file
+{
+	my $context = shift;
+
+	if (open(FH, "<", _PATH_ISSUE)) {
+		while (<FH>) {
+			chomp;
+			s/(\\.)/subst_issue($context,$1)/ge;
+			push(@{$context->{issue}}, $_);
+		}
+		close(FH);
+	}
+}
+
+sub read_login_defs
+{
+	my $context = shift;
+
+	$context->{config}->{FAIL_DELAY} = 3;
+	$context->{config}->{TTYGROUP} = "tty";
+	$context->{config}->{TTYPERM} = 0620;
+	$context->{config}->{FAKE_SHELL} = "";
+	$context->{config}->{ENV_PATH} = _PATH_DEFPATH;
+	$context->{config}->{ENV_SUPATH} = _PATH_DEFPATH_ROOT;
+
+	if (open(FH, "<", _PATH_LOGINDEFS)) {
+		while (<FH>) {
+			my ($k, $v);
+			$context->{config}->{$k} = $v if ($k, $v) = /^\s*([A-Z0-9_]+)\s+(0\d+|0x\d+|\d|yes|no|\S.*)\s*$/;
+		}
+		close(FH);
+	}
+	return 1;
+}
+
+sub set_groups
+{
+	my $context = shift;
+
+	initgroups($context->{passwd}->[PW_NAME], $context->{passwd}->[PW_GID]) ||
+		return errmsg("Groups initialization failed: %s", $!);
+
+	setgid($context->{passwd}->[PW_GID]) ||
+		return errmsg("Unable to change gid to %d: %s", $context->{passwd}->[PW_GID], $!);
+
+	return 1;
+}
+
+sub init_environ
+{
+	my $context = shift;
+	my $termenv = $ENV{TERM} || "dumb";
+
+	%ENV = ();
+
+	$ENV{TERM}    = $termenv;
+	$ENV{MAIL}    = _PATH_MAILDIR . "/" . $context->{passwd}->[PW_NAME];
+	$ENV{HOME}    = $context->{passwd}->[PW_HOME];
+	$ENV{USER}    = $context->{passwd}->[PW_NAME];
+	$ENV{LOGNAME} = $context->{passwd}->[PW_NAME];
+	$ENV{SHELL}   = $context->{config}->{FAKE_SHELL} || $context->{passwd}->[PW_SHELL];
+	$ENV{PATH}    = $context->{config}->{ENV_PATH};
+	$ENV{PATH}    = $context->{config}->{ENV_SUPATH} if ! $context->{passwd}->[PW_UID];
+
+	if (HAVE_PAM_ENV_FUNCTIONS()) {
+		my %pamenv = pam_getenvlist($context->{pamh});
+		%ENV = (%ENV, %pamenv) if %pamenv;
+	}
+
+	return 1;
+}
+
+sub basename { return substr($_[0], rindex($_[0], "/") + 1); }
+sub login_exec { exec {$_[0]} "-" . basename($_[0]), @_[1..$#_]; }
+
+sub main
+{
+	$0 = PROGNAME;
+
+	GetOptions(
+		"h|help" => sub {
+			print STDOUT "Usage: ", PROGNAME, " [options] [ttyname]\n";
+			print STDOUT "\n";
+			print STDOUT "Begin a session on the system.\n";
+			print STDOUT "\n";
+			print STDOUT "Options:\n";
+			print STDOUT "  -V, --version   output version information and exit;\n";
+			print STDOUT "  -h, --help      display this help and exit.\n";
+			print STDOUT "\n";
+			print STDOUT "Report bugs to authors.\n\n";
+			exit(EXIT_SUCCESS);
+		},
+		"V|version" => sub {
+			print STDOUT PROGNAME, " version ", VERSION, "\n";
+			exit(EXIT_SUCCESS);
+		},
+	) || die("Try \`", PROGNAME, " --help' for more information.\n");
+
+	my $context = {
+		pamh  => undef,
+		tty   => ttyname(fileno(STDIN)) || "",
+		uname => [],
+		issue => [],
+	};
+
+	if (@ARGV) {
+		$context->{tty} = $ARGV[0];
+		$context->{tty} = "/dev/" . $ARGV[0] if substr($ARGV[0], 0, 5) ne "/dev/";
+	}
+	@{$context->{uname}} = uname();
+
+	setpgrp();
+
+	return EXIT_FAILURE if (
+		! init_tty($context) ||
+		! read_login_defs($context) ||
+		! read_issue_file($context)
+	);
+
+	openlog(PROGNAME, LOG_ODELAY|LOG_PERROR, LOG_AUTHPRIV);
+
+	init_pam($context) ||
+		return EXIT_FAILURE;
+
+	$0 = PROGNAME . " " . $context->{tty};
+	{
+		my $screen = init_curs_screen($context);
+
+		init_login_window($screen);
+		init_password_window($screen);
+
+		set_curs_focus($screen, "login");
+		draw_curs_screen($screen);
+		run_curs_loop($screen);
+
+		exit(EXIT_SUCCESS) if $abort;
+
+		my $username = $screen->{childs}->{login}->{text};
+		my $password = $screen->{childs}->{password}->{text};
+
+		clear_curs_screen($context, $screen);
+
+		return curs_errmsg($context, $screen)
+			if ! auth($context, $username, $password);
+
+		$username = undef;
+		$password = undef;
+
+		return curs_errmsg($context, $screen) if (
+			! set_groups($context) ||
+			! open_pam_session($context) ||
+			! chown_tty($context) ||
+			! init_environ($context)
+		);
+
+		# Finish user interface
+		endwin();
+	}
+
+	$SIG{HUP} = "IGNORE";
+	$SIG{INT} = "IGNORE";
+
+	# Detach the controlling tty.
+	# We don't need the tty in a parent who only waits for a child.
+	# The child calls setsid() that detaches from the tty as well.
+	ioctl(STDIN, &TIOCNOTTY, 0) ||
+		errmsg("ioctl(TIOCNOTTY) failed: %s", $!);
+
+	$0 = PROGNAME . " -- " . $ENV{LOGNAME};
+
+	my $child_pid = fork();
+
+	if (! defined($child_pid)) {
+		pam_setcred($context->{pamh}, PAM_DELETE_CRED());
+
+		errmsg("fork failed: %s", $!);
+		closelog();
+
+		sleep($context->{config}->{FAIL_DELAY});
+		return EXIT_FAILURE;
+	}
+
+	if ($child_pid) {
+		$context->{config} = {};
+		$context->{passwd} = {};
+
+		$SIG{QUIT} = "IGNORE";
+		$SIG{INT} = "IGNORE";
+
+		close(STDIN);
+		close(STDOUT);
+		close(STDERR);
+
+		1 while $child_pid != waitpid(-1, 0);
+
+		pam_setcred($context->{pamh}, PAM_DELETE_CRED());
+		pam_end($context->{pamh}, pam_close_session($context->{pamh}, 0));
+
+		return EXIT_SUCCESS;
+	}
+
+	closelog();
+
+	setsid();
+	open_tty($context->{tty});
+
+	# re-open
+	openlog(PROGNAME, LOG_ODELAY|LOG_PERROR, LOG_AUTHPRIV);
+
+	ioctl(STDIN, &TIOCSCTTY, 1) ||
+		return errmsg("ioctl(TIOCSCTTY) failed: %s: %s", $context->{tty}, $!);
+
+	$SIG{HUP} = "DEFAULT";
+	$SIG{INT} = "DEFAULT";
+
+	setuid($context->{passwd}->[PW_UID]) ||
+		return errmsg("setuid failed: %s", $!);
+
+	chdir($context->{passwd}->[PW_HOME]) || chdir("/") ||
+		errmsg("chdir failed: %s", $!);
+
+	pam_end($context->{pamh}, PAM_SUCCESS());
+
+	login_exec("./" . _PATH_LOGIN_FILENAME) if -x _PATH_LOGIN_FILENAME;
+	login_exec(_PATH_BSHELL, "-c", "exec " . $ENV{SHELL}) if $ENV{SHELL} =~ / /;
+	login_exec($ENV{SHELL});
+	login_exec(_PATH_BSHELL);
+
+	die("exec failed: ", $!);
+}
+
+exit(main());
